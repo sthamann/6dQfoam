@@ -502,9 +502,9 @@ This project is licensed under the MIT License - see [LICENSE.md](LICENSE.md) fo
 ## Contact
 
 - **Principal Investigator**: Stefan Hamann
-- **Email**: [contact email]
-- **Project Website**: [project URL]
-- **Preprint**: [arXiv link when available]
+- **Email**: sh@sh-future.de
+- **Project Website**: NaN
+- **Preprint**: NaN
 
 ---
 
