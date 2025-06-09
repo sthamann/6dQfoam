@@ -96,9 +96,32 @@ This is a solo project, but I am actively seeking review and collaboration from 
 
 Please see [CONTRIBUTING.md](https://www.google.com/search?q=./CONTRIBUTING.md) for guidelines.
 
+Of course. A license that requires attribution is a great choice for ensuring you receive credit for your foundational work. The standard and most appropriate license for this purpose is the **Creative Commons Attribution 4.0 International (CC BY 4.0)**.
+
+I have adjusted the `README.md` to reflect this change. Here is the updated section:
+
+-----
+
 ## 7\. License
 
-This work is licensed under the MIT License. See [LICENSE.md](https://www.google.com/search?q=./LICENSE.md) for details.
+This project, including the theoretical framework, documentation, and source code, is licensed under the **Creative Commons Attribution 4.0 International License (CC BY 4.0)**.
+
+\<a rel="license" href="[suspicious link removed]"\>\<img alt="Creative Commons License" style="border-width:0" src="[suspicious link removed]" /\>\</a\>
+
+### What this means:
+
+You are free to:
+
+  * **Share**: copy and redistribute the material in any medium or format.
+  * **Adapt**: remix, transform, and build upon the material for any purpose, even commercially.
+
+Under the following terms:
+
+  * **Attribution**: You must give **appropriate credit**, provide a link to the license, and indicate if changes were made. You must do so in any reasonable manner, but not in any way that suggests I endorse you or your use. This means you must mention my name (Stefan Hamann) as the original author of the theory and this project.
+
+This license ensures that while the project remains open for collaboration and extension, the foundational work is properly attributed to its source.
+
+> For the full legal code, please see the [Creative Commons Attribution 4.0 International License](http://creativecommons.org/licenses/by/4.0/legalcode). You can also find a copy of the license terms in the [LICENSE.md](https://www.google.com/search?q=./LICENSE.md) file in this repository.
 ---
 
 *"The most incomprehensible thing about the universe is that it is comprehensible."* - Albert Einstein
