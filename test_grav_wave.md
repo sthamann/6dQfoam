@@ -64,6 +64,7 @@ GW190814	—	0.0	100.0	2.0	—	0.0	not significant
 GW190519_153544	—	—	50.0	2.6	—	2.6	single detector only
 GW190602_175927	—	—	50.0	2.3	—	2.3	single detector only
 
+![image](https://github.com/user-attachments/assets/8c252c56-65e6-47d6-914d-4176fc46b54d)
 
 ⸻
 
