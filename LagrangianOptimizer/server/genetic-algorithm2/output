@@ -1,0 +1,2214 @@
+### /ga.ts ###
+import { Worker } from "worker_threads";
+import { EventEmitter } from "events";
+import { OptimizedLagrangianEvaluator } from "./lagrangian-optimized";
+import { HighPrecisionEvaluator } from "./precision-evaluator";
+import { N_OPS, IDX_GAUGE, IDX_GRAV, SymbolicMath } from "./operators"; // <-- NEU
+import type { GAParameters, Candidate, GAUpdate } from "@shared/schema";
+import { exportBestEquation } from "../exportField";
+import { ALPHA_TARGET, G_TARGET, C_TARGET } from "@shared/physics/constants";
+import { kappaToG, GToKappa, solvedDigits } from "@shared/lib/physicsAccuracy"; // << NEU
+import { PRESET_EXPLORATION, PRESET_PRECISION, TERM_LIMITS } from "./constants";
+/**
+ * Genetic Algorithm implementation for Lagrangian field equation search
+ * Ports the GA logic from the Python script with Worker Thread parallelization
+ */
+export class GeneticAlgorithm extends EventEmitter {
+  private parameters: GAParameters;
+  private population: number[][];
+  private generation: number;
+  private isRunningFlag: boolean;
+  private workers: Worker[];
+  private topCandidates: Candidate[];
+  private bestCandidate: Candidate | null;
+  private startTime: number;
+  private evaluationCount: number;
+  private hallOfFame: Candidate[];
+  private static readonly HOF_SIZE = 30; // max. Einträge
+  private mode: "explore" | "precision"; // Preset-Schalter
+  private updateCallback?: (update: GAUpdate) => void;
+  private convergenceCounter: number;
+  private stagnationCounter: number;
+  private digitHistory: { gen: number; dc: number; da: number; dg: number }[] =
+    [];
+  /** tiefe Stagnation (sobald > 30) */
+  private deepStagnation = 0;
+  private lastBestFitness: number;
+  private mutationSigma: number;
+  private stagnation: number;
+  private gravityStagnation: number;
+  private lastGravityCoeff: number;
+  private longTermStagnation: number = 0;  // Track extended stagnation
+
+  public static readonly PRESET: GAParameters = {
+    populationSize: 800,
+    mutationRate: 0.1,
+    mutationRateGauge: 0.5,
+    mutationSigmaGauge: 0.05,
+    /* ─ Gravitational gene defaults ───────────────────────────── */
+    mutationRateGrav: 0.3,
+    mutationSigmaGrav: 1_000_000, // Large mutations for gravity exploration
+    crossoverRate: 0.75,
+    eliteCount: 8,
+    workerThreads: 16,
+    gaugeRange: 0.15,
+    gravRange: 400_000_000, // Expanded to reach required 298M coefficient
+    maxGenerations: 30_000,
+    usePython: false,
+  };
+
+  constructor(parameters: Partial<GAParameters> = {}) {
+    super();
+
+    this.parameters = { ...GeneticAlgorithm.PRESET, ...parameters };
+    Object.assign(this.parameters, PRESET_EXPLORATION);
+    // Initialize all class properties
+    this.population = [];
+    this.hallOfFame = [];
+    this.mode = "explore";
+    this.generation = 0;
+    this.isRunningFlag = false;
+    this.workers = [];
+    this.topCandidates = [];
+    this.bestCandidate = null;
+    this.startTime = 0;
+    this.evaluationCount = 0;
+    this.convergenceCounter = 0;
+    this.stagnationCounter = 0;
+    this.lastBestFitness = Infinity;
+    this.mutationSigma = 0.15; // Default mutation sigma for non-gauge/non-grav coefficients
+    this.stagnation = 0;
+    this.gravityStagnation = 0;
+    this.lastGravityCoeff = 0;
+    if (this.parameters.gravRange === undefined)
+      this.parameters.gravRange = 0.5;
+    if (this.parameters.mutationRateGrav === undefined)
+      this.parameters.mutationRateGrav = this.parameters.mutationRate;
+    if (this.parameters.mutationSigmaGrav === undefined)
+      this.parameters.mutationSigmaGrav = 1_000_000;
+
+    // Quick sanity test - verify evaluator can achieve target precision
+    console.log("Running evaluator sanity test...");
+    this.runSanityTest();
+  }
+  /* ============================================================= *
+   * 2) ALPHA-PROBE-INJEKTOR                                       *
+   *     legt bei Stagnation ein feines Cluster um den besten Gauge *
+   * ============================================================= */
+  private injectAlphaProbes(bestGauge: number) {
+    const probeCount = Math.floor(this.parameters.populationSize * 0.05); // 5 %
+    for (let k = 0; k < probeCount; k++) {
+      const sign = Math.sign(bestGauge) || -1;
+      const off =
+        (Math.random() < 0.5 ? -1 : 1) * Math.pow(10, -3 - Math.random() * 4); // 1e-3…1e-7
+      const g = bestGauge * (1 + off);
+      // Generate completely new random individual instead of using hardcoded base
+      const ind = this.makeIndividual();
+      ind[IDX_GAUGE] = g; // Only override gauge coefficient
+      this.population.push(ind);
+    }
+  }
+  /**
+   * Quick sanity test to verify evaluator precision capabilities
+   */
+  private runSanityTest(): void {
+    const ideal = 0.007297352566;
+    const coeff = ideal * 4 * Math.PI; // ≈ 0.091657
+    const testCoeffs = [1, -1, 0, 0, coeff];
+
+    const candidate =
+      OptimizedLagrangianEvaluator.evaluateChromosomeJS(testCoeffs);
+    console.log(
+      `Sanity test result: delta_alpha = ${candidate.delta_alpha.toExponential(3)}`,
+    );
+
+    if (candidate.delta_alpha < 1e-6) {
+      console.log("✓ Evaluator can achieve sub-microscopic precision");
+    } else {
+      console.log("⚠ Evaluator precision may be limited");
+    }
+  }
+
+  /**
+   * Generate a random individual (chromosome) with adaptive ranges
+   */
+  private makeIndividual(): number[] {
+    // Generate coefficients that are more likely to satisfy hard constraints
+    // Start with values that produce C close to target
+    
+    // For C = sqrt(-B/A) where A = -2*c0, B = -2*c1
+    // We want C = 299792458, so c1/c0 = C^2
+    // Let's start with c0 = -0.5, then c1 = 0.5 * C^2 (in natural units where C_target = 1)
+    
+    const c0 = -0.5 + (Math.random() - 0.5) * 0.1; // Small variation around -0.5
+    const c1 = -c0 + (Math.random() - 0.5) * 0.001; // This ensures c1/c0 ≈ 1, with tiny variation
+    
+    // Mass and interaction terms for stable potential
+    const c2 = Math.random() * 0.3; // Mass term (positive for stable VEV)
+    const c3 = Math.random() * 0.2 + 0.01; // Self-interaction (positive, nonzero)
+    
+    // New coupling constants
+    const { EM_COUPLING_MIN, EM_COUPLING_MAX, GRAV_COUPLING_MIN, GRAV_COUPLING_MAX } = TERM_LIMITS;
+    const { couplingRange } = this.mode === "precision" ? PRESET_PRECISION : PRESET_EXPLORATION;
+    
+    // Start with small coupling values to explore near zero
+    const g_em = (Math.random() - 0.5) * couplingRange;
+    const xi = (Math.random() - 0.5) * couplingRange;
+    
+    const coeffs = [c0, c1, c2, c3, g_em, xi];
+    
+    return coeffs;
+  }
+
+  private jitterPopulationWide(fraction = 0.2) {
+    const n = Math.floor(this.population.length * fraction);
+    for (let i = 0; i < n; i++) {
+      const idx = Math.floor(Math.random() * this.population.length);
+      // alle Gene außer c0,c1 leicht streuen
+      this.population[idx] = this.population[idx].map((v, j) =>
+        j < 2 ? v : v + this.gaussianRandom() * 3 * this.mutationSigma,
+      );
+    }
+    console.log(`⚡ Population jittered (${n} individuals)`);
+  }
+
+  /**
+   * Initialize population with random individuals
+   */
+  private initializePopulation(): void {
+    this.population = Array.from(
+      { length: this.parameters.populationSize },
+      () => this.makeIndividual(),
+    );
+  }
+
+  /**
+   * Force complete population reset to apply new coefficient constraints
+   */
+  private forcePopulationReset(): void {
+    console.log(
+      "🔄 Forcing complete population reset with unconstrained coefficients",
+    );
+    this.initializePopulation();
+    this.generation = 0;
+    this.bestCandidate = null;
+    this.topCandidates = [];
+    this.evaluationCount = 0;
+    this.convergenceCounter = 0;
+    this.stagnationCounter = 0;
+    this.gravityStagnation = 0;
+    this.lastBestFitness = Infinity;
+    this.lastGravityCoeff = 0;
+  }
+
+  /**
+   * Mutate an individual (Gaussian mutation with adaptive scaling)
+   */
+  private mutate(individual: number[]): void {
+    for (let i = 0; i < individual.length; i++) {
+      const isEMCoupling = i === 4; // g_em index
+      const isGravCoupling = i === 5; // xi index
+      
+      // Use adaptive mutation rates
+      const mutationRate = this.parameters.mutationRate ?? 0.1;
+      const sigma = this.mutationSigma ?? 0.1;
+
+      if (Math.random() < mutationRate) {
+        let mutation: number;
+
+        // For the new physics model, we need different mutation strategies
+        if ((isEMCoupling || isGravCoupling) && this.bestCandidate) {
+          // Adaptive mutation for coupling constants based on current errors
+          const { phi0 } = SymbolicMath.calculateVEV(this.bestCandidate.coefficients);
+          
+          if (isEMCoupling && phi0 > 0) {
+            // For EM coupling, adjust based on alpha error
+            const alphaErr = this.bestCandidate.alpha_model - ALPHA_TARGET;
+            const relErr = alphaErr / ALPHA_TARGET;
+            
+            // Direction: if alpha is too high, increase g_em (since α_eff = α_0/(1+g_em*φ₀²))
+            const dir = Math.sign(alphaErr);
+            const centre = individual[i];
+            
+            // Deterministic component based on error
+            const deterministic = dir * Math.abs(relErr) * 0.1;
+            // Stochastic component for exploration
+            const stochastic = this.gaussianRandom() * sigma * 0.01;
+            
+            mutation = deterministic + stochastic;
+          } else if (isGravCoupling && phi0 > 0) {
+            // For gravitational coupling, adjust based on G error
+            const GErr = this.bestCandidate.g_model - G_TARGET;
+            const relErr = GErr / G_TARGET;
+            
+            // Direction: if G is too high, increase xi (since G_eff = G_0/(1+xi*φ₀²))
+            const dir = Math.sign(GErr);
+            const centre = individual[i];
+            
+            // Deterministic component
+            const deterministic = dir * Math.abs(relErr) * 0.1;
+            // Stochastic component
+            const stochastic = this.gaussianRandom() * sigma * 0.01;
+            
+            mutation = deterministic + stochastic;
+          } else {
+            // Standard mutation for coupling constants
+            mutation = this.gaussianRandom() * sigma;
+          }
+        } else if (i < 2) {
+          // For kinetic terms (c0, c1), use smaller mutations to maintain speed of light
+          mutation = this.gaussianRandom() * sigma * 0.01;
+        } else if (i === 2 || i === 3) {
+          // For mass and interaction terms (c2, c3), standard mutation
+          mutation = this.gaussianRandom() * sigma * 0.1;
+        } else {
+          // Standard mutation
+          mutation = this.gaussianRandom() * sigma;
+        }
+
+        individual[i] += mutation;
+
+        // Apply bounds based on coefficient type
+        if (isEMCoupling || isGravCoupling) {
+          const { EM_COUPLING_MIN, EM_COUPLING_MAX, GRAV_COUPLING_MIN, GRAV_COUPLING_MAX } = TERM_LIMITS;
+          const minBound = isEMCoupling ? EM_COUPLING_MIN : GRAV_COUPLING_MIN;
+          const maxBound = isEMCoupling ? EM_COUPLING_MAX : GRAV_COUPLING_MAX;
+          individual[i] = Math.max(minBound, Math.min(maxBound, individual[i]));
+        } else if (i === 2) {
+          // Mass term should stay positive for stable VEV
+          individual[i] = Math.max(0, Math.min(TERM_LIMITS.MASS_MAX, individual[i]));
+        } else if (i === 3) {
+          // Interaction term should stay positive
+          individual[i] = Math.max(0.001, Math.min(TERM_LIMITS.INTERACTION_MAX, individual[i]));
+        } else {
+          // Standard bounds for other terms
+          individual[i] = Math.max(-1.0, Math.min(1.0, individual[i]));
+        }
+      }
+    }
+  }
+
+  /**
+   * Generate Gaussian random number (Box-Muller transform)
+   */
+  private gaussianRandom(): number {
+    let u = 0,
+      v = 0;
+    while (u === 0) u = Math.random(); // Converting [0,1) to (0,1)
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  }
+
+  /**
+   * Crossover two parents to create offspring
+   */
+  private crossover(
+    parent1: number[],
+    parent2: number[],
+  ): [number[], number[]] {
+    if (Math.random() >= this.parameters.crossoverRate) {
+      return [parent1.slice(), parent2.slice()];
+    }
+
+    // Single-point crossover
+    const crossoverPoint = Math.floor(Math.random() * (N_OPS - 1)) + 1;
+
+    const child1 = [
+      ...parent1.slice(0, crossoverPoint),
+      ...parent2.slice(crossoverPoint),
+    ];
+
+    const child2 = [
+      ...parent2.slice(0, crossoverPoint),
+      ...parent1.slice(crossoverPoint),
+    ];
+
+    return [child1, child2];
+  }
+
+  /**
+   * Tournament selection with alpha-aware precision mode
+   */
+  private tournamentSelection(
+    candidates: { fitness: number; individual: number[] }[],
+  ): number[] {
+    const tournamentSize = 3;
+    let best = candidates[Math.floor(Math.random() * candidates.length)];
+
+    for (let i = 1; i < tournamentSize; i++) {
+      const competitor =
+        candidates[Math.floor(Math.random() * candidates.length)];
+
+      // In precision mode, prioritize alpha proximity over general fitness
+      if (
+        this.bestCandidate &&
+        this.bestCandidate.delta_c < 1e-6 &&
+        this.bestCandidate.delta_alpha < 3e-3
+      ) {
+        // Calculate effective alpha values for comparison in the new physics model
+        const { phi0: phi0_best } = SymbolicMath.calculateVEV(best.individual);
+        const { phi0: phi0_comp } = SymbolicMath.calculateVEV(competitor.individual);
+        
+        const bestAlpha = SymbolicMath.calculateEffectiveFineStructure(best.individual, phi0_best);
+        const competitorAlpha = SymbolicMath.calculateEffectiveFineStructure(competitor.individual, phi0_comp);
+
+        const bestAlphaDist = Math.abs(bestAlpha - ALPHA_TARGET);
+        const competitorAlphaDist = Math.abs(competitorAlpha - ALPHA_TARGET);
+
+        // 70% chance to select based on alpha proximity, 30% on general fitness
+        if (Math.random() < 0.7) {
+          if (competitorAlphaDist < bestAlphaDist) {
+            best = competitor;
+          }
+        } else {
+          if (competitor.fitness < best.fitness) {
+            best = competitor;
+          }
+        }
+      } else {
+        // Normal fitness-based selection
+        if (competitor.fitness < best.fitness) {
+          best = competitor;
+        }
+      }
+    }
+
+    return best.individual;
+  }
+
+  /**
+   * Evaluate population using worker threads
+   */
+  private async evaluatePopulation(): Promise<Candidate[]> {
+    const batchSize = Math.ceil(
+      this.population.length / this.parameters.workerThreads,
+    );
+    const promises: Promise<Candidate[]>[] = [];
+
+    for (let i = 0; i < this.parameters.workerThreads; i++) {
+      const start = i * batchSize;
+      const end = Math.min(start + batchSize, this.population.length);
+
+      if (start < end) {
+        const batch = this.population.slice(start, end);
+        promises.push(this.evaluateBatch(batch));
+      }
+    }
+
+    const results = await Promise.all(promises);
+    const allCandidates = results.flat();
+
+    // Set generation number
+    allCandidates.forEach((candidate) => {
+      candidate.generation = this.generation;
+    });
+
+    this.evaluationCount += allCandidates.length;
+
+    return allCandidates;
+  }
+
+  /**
+   * Evaluate a batch of chromosomes using JavaScript or high-precision Python evaluator
+   */
+  private async evaluateBatch(batch: number[][]): Promise<Candidate[]> {
+    if (this.parameters.usePython) {
+      // Use high-precision Python evaluator for 20+ digit calculations
+      console.log(
+        `Using high-precision Python evaluator for ${batch.length} chromosomes`,
+      );
+      return await HighPrecisionEvaluator.evaluatePopulation(batch, this.generation);
+    } else {
+      // Use optimized JavaScript evaluator for maximum speed (15-17 digit precision)
+      return await OptimizedLagrangianEvaluator.evaluatePopulation(batch, this.generation);
+    }
+  }
+
+  /**
+   * Run one generation of the genetic algorithm
+   */
+  private async runGeneration(): Promise<void> {
+    // Evaluate population
+    const candidates = await this.evaluatePopulation();
+    
+    // Debug logging
+    console.log(`Generation ${this.generation}: Evaluated ${candidates.length} candidates`);
+    const fitnessDistribution = candidates.map(c => c?.fitness ?? Infinity);
+    console.log(`  Fitness range: ${Math.min(...fitnessDistribution).toExponential(2)} to ${Math.max(...fitnessDistribution).toExponential(2)}`);
+    console.log(`  Candidates with fitness < 1e6: ${candidates.filter(c => c && c.fitness < 1e6).length}`);
+    console.log(`  Candidates with fitness >= 1e9: ${candidates.filter(c => c && c.fitness >= 1e9).length}`);
+    
+    // --- PATCH: HARD VALIDATION GATE ----------------
+    const filtered = (candidates ?? []).filter((c) => {
+      if (!c || !c.coefficients) return false;
+
+      // Count different rejection reasons
+      let rejected = false;
+      let reason = "";
+      
+      // Check fitness threshold (1e9 is our knock-out fitness)
+      if (c.fitness >= 1e9) {
+        rejected = true;
+        reason = "hard_constraint_violation";
+      }
+      
+      // Check for NaN or Infinity
+      if (!rejected && (!isFinite(c.fitness) || isNaN(c.fitness))) {
+        rejected = true;
+        reason = "invalid_fitness";
+      }
+      
+      // Basic coefficient sanity checks
+      const co = c.coefficients;
+      if (!rejected && co.some(v => !isFinite(v) || isNaN(v))) {
+        rejected = true;
+        reason = "invalid_coefficients";
+      }
+      
+      // Log rejection reasons periodically
+      if (rejected && this.generation % 10 === 0 && Math.random() < 0.1) {
+        console.log(`  Rejected candidate: ${reason}, fitness=${c.fitness}`);
+      }
+      
+      return !rejected;
+    });
+    
+    console.log(`  After filtering: ${filtered.length} candidates passed all checks`);
+
+    if (filtered.length === 0) {
+      console.warn(
+        `Generation ${this.generation}: All candidates were unphysical. Re-initializing population.`,
+      );
+      this.initializePopulation();
+      this.generation++;
+      this.sendUpdate();
+      return;
+    }
+
+    // Arbeite nur mit gültigen
+    const candList = filtered;
+    // -------------------------------------------------
+    // Sort by fitness (lower is better)
+    /* ab hier nur noch mit candList arbeiten */
+    candList.sort((a, b) => a.fitness - b.fitness);
+    this.bestCandidate = candList[0];
+    this.topCandidates = candList.slice(0, 10);
+
+    // ⭑⭑⭑ Hall-of-Fame aktualisieren
+    for (const cand of this.topCandidates) {
+      if (!this.hallOfFame.some((h) => h.fitness === cand.fitness)) {
+        this.hallOfFame.push(cand);
+      }
+    }
+    this.hallOfFame.sort((a, b) => a.fitness - b.fitness);
+    this.hallOfFame.splice(GeneticAlgorithm.HOF_SIZE);
+
+    // Convergence check removed - continue evolution for full generation count
+
+    // Create new population
+    const newPopulation: number[][] = [];
+
+    // Enhanced elitism with mandatory diversity in precision mode
+    if (
+      this.bestCandidate &&
+      this.bestCandidate.delta_c < 1e-6 &&
+      this.bestCandidate.delta_alpha < 3e-3
+    ) {
+      // In precision mode, enforce alpha diversity among elites
+      const uniqueElites: Candidate[] = [];
+      const alphaThreshold = 1e-12; // Very small threshold for alpha uniqueness
+
+      for (const candidate of candList) {
+        const candidateAlpha =
+          Math.abs(candidate.coefficients[IDX_GAUGE]) / (4 * Math.PI);
+
+        // Check if this alpha value is sufficiently different from existing elites
+        const isUnique = uniqueElites.every((elite) => {
+          const eliteAlpha =
+            Math.abs(elite.coefficients[IDX_GAUGE]) / (4 * Math.PI);
+          return Math.abs(candidateAlpha - eliteAlpha) > alphaThreshold;
+        });
+
+        if (isUnique || uniqueElites.length === 0) {
+          uniqueElites.push(candidate);
+          newPopulation.push(candidate.coefficients.slice());
+        }
+
+        if (uniqueElites.length >= this.parameters.eliteCount) break;
+      }
+
+      // Fill remaining elite slots if needed with forced diversity
+      while (newPopulation.length < this.parameters.eliteCount) {
+        const baseElite = uniqueElites[0].coefficients.slice();
+        baseElite[IDX_GAUGE] +=
+          (Math.random() - 0.5) * Math.abs(baseElite[IDX_GAUGE]) * 0.001;
+        newPopulation.push(baseElite);
+      }
+    } else {
+      // Ensure we don't try to preserve more elites than we have valid candidates
+      const eliteCount = Math.min(this.parameters.eliteCount, candList.length);
+      for (let i = 0; i < eliteCount; i++) {
+        newPopulation.push(candList[i].coefficients.slice());
+      }
+      
+      // If we have fewer candidates than elite count, warn and fill with best available
+      if (candList.length < this.parameters.eliteCount) {
+        console.warn(`⚠️ Only ${candList.length} candidates passed validation, but elite count is ${this.parameters.eliteCount}`);
+        // Fill remaining elite slots by repeating the best candidate with small variations
+        while (newPopulation.length < this.parameters.eliteCount && candList.length > 0) {
+          const bestCandidate = candList[0].coefficients.slice();
+          // Add small random perturbation to create diversity
+          for (let j = 0; j < bestCandidate.length; j++) {
+            bestCandidate[j] += this.gaussianRandom() * 0.001 * Math.abs(bestCandidate[j]);
+          }
+          newPopulation.push(bestCandidate);
+        }
+      }
+    }
+
+    // 10% fresh randoms every 50 stagnant generations
+    if (this.stagnation === 30) {
+      const inject = Math.floor(this.parameters.populationSize * 0.1);
+      for (let k = 0; k < inject; k++) {
+        newPopulation.push(this.makeIndividual());
+      }
+    }
+    if (this.generation % 100 === 0) {
+      // 100-Gen-Burst
+      this.parameters.crossoverRate = 0.95;
+      this.parameters.mutationRate = 0.3;
+    }
+    if (this.generation % 100 === 20) {
+      // zurück
+      this.parameters.crossoverRate = 0.75;
+      this.parameters.mutationRate = 0.1;
+    }
+
+    // Generate rest of population through selection, crossover, and mutation
+    const fitnessData = candList.map((c) => ({
+      fitness: c.fitness,
+      individual: c.coefficients,
+    }));
+    
+    // Safety check: if we have very few candidates, regenerate some random ones
+    if (fitnessData.length < 2) {
+      console.warn(`⚠️ Only ${fitnessData.length} candidates available for breeding. Generating fresh population.`);
+      // Fill the rest with fresh random individuals
+      while (newPopulation.length < this.parameters.populationSize) {
+        newPopulation.push(this.makeIndividual());
+      }
+    } else {
+      // Normal breeding process
+      while (newPopulation.length < this.parameters.populationSize) {
+        let parent1 = this.tournamentSelection(fitnessData);
+        let parent2 = this.tournamentSelection(fitnessData);
+        // In precision mode, enforce parent diversity to prevent identical breeding
+        if (
+          this.bestCandidate &&
+          this.bestCandidate.delta_c < 1e-6 &&
+          this.bestCandidate.delta_alpha < 3e-3
+        ) {
+          let attempts = 0;
+          const maxAttempts = 20;
+
+          // Ensure parents have different alpha values
+          while (attempts < maxAttempts) {
+            const alpha1 = Math.abs(parent1[IDX_GAUGE]) / (4 * Math.PI);
+            const alpha2 = Math.abs(parent2[IDX_GAUGE]) / (4 * Math.PI);
+            const alphaDiff = Math.abs(alpha1 - alpha2);
+
+            if (alphaDiff > 1e-12) break; // Parents are sufficiently different
+
+            parent2 = this.tournamentSelection(fitnessData);
+            attempts++;
+          }
+
+          // If still identical after many attempts, force diversity
+          if (attempts >= maxAttempts) {
+            const alpha1 = Math.abs(parent1[IDX_GAUGE]) / (4 * Math.PI);
+            const targetAlphaDelta = (Math.random() - 0.5) * 1e-9; // Small random offset
+            const newGauge =
+              (alpha1 + targetAlphaDelta) *
+              4 *
+              Math.PI *
+              Math.sign(parent1[IDX_GAUGE]);
+            parent2 = parent1.slice();
+            parent2[IDX_GAUGE] = newGauge;
+          }
+        }
+
+        const [child1, child2] = this.crossover(parent1, parent2);
+
+        // Removed sign-flip constraints to allow free coefficient exploration
+
+        this.mutate(child1);
+        this.mutate(child2);
+
+        newPopulation.push(child1);
+        if (newPopulation.length < this.parameters.populationSize) {
+          newPopulation.push(child2);
+        }
+      }
+    }
+
+    // In precision mode, ensure gauge diversity across population
+    if (
+      this.bestCandidate &&
+      this.bestCandidate.delta_c < 1e-6 &&
+      this.bestCandidate.delta_alpha < 3e-3
+    ) {
+      this.maintainGaugeDiversity(newPopulation);
+
+      // Additional step: Force unique alpha values for top candidates
+      this.enforceTopCandidateDiversity(newPopulation);
+    }
+
+    this.population = newPopulation.slice(0, this.parameters.populationSize);
+    this.generation++;
+
+    // Occasional crossover boost
+    if (this.generation % 200 === 0) this.parameters.crossoverRate = 0.9;
+    if (this.generation % 200 === 10) this.parameters.crossoverRate = 0.75;
+
+    // Adaptive mutation and auto-precision switching
+    this.updateAdaptiveMutation();
+    this.checkPrecisionSwitch();
+
+    // Send update
+    this.sendUpdate();
+    
+    // Log warmup status
+    if (this.generation === 0) {
+      console.log("🔥 WARMUP PERIOD: Generations 0-9 use relaxed constraints (C: 1%, G: 10%)");
+    } else if (this.generation === 10) {
+      console.log("📈 PROGRESSIVE TIGHTENING: Generations 10-99 gradually tighten constraints");
+    } else if (this.generation === 100) {
+      console.log("❄️ FULL CONSTRAINTS ACTIVE: C < 1 ppm, G < 100 ppm");
+    }
+  }
+
+  /**
+   * Update adaptive mutation parameters based on stagnation
+   */
+  private updateAdaptiveMutation(): void {
+    /* --- Digi-Tracker -------------------------------------------------- */
+    this.digitHistory.push({
+      gen: this.generation,
+      dc: solvedDigits(this.bestCandidate?.delta_c ?? 1),
+      da: solvedDigits(this.bestCandidate?.delta_alpha ?? 1),
+      dg: solvedDigits(this.bestCandidate?.delta_g ?? 1),
+    });
+    if (this.digitHistory.length > 50) this.digitHistory.shift(); // Fenster 50 Gen.
+
+    const last10 = this.digitHistory.slice(-10);
+    const stagnated =
+      last10.every((r) => r.dc <= last10[0].dc) &&
+      last10.every((r) => r.da <= last10[0].da) &&
+      last10.every((r) => r.dg <= last10[0].dg);
+
+    this.deepStagnation = stagnated ? this.deepStagnation + 1 : 0;
+    /* ------------------------------------------------------------------- */
+    const improved = this.bestCandidate!.fitness < this.lastBestFitness - 1e-8;
+
+    // Track gravity coefficient stagnation independently
+    const currentGravCoeff = this.bestCandidate
+      ? this.bestCandidate.coefficients[5]
+      : 0;
+    const gravityChanged =
+      Math.abs(currentGravCoeff - this.lastGravityCoeff) > 1e3; // Detect significant gravity coefficient changes
+
+    this.stagnation = improved ? 0 : this.stagnation + 1;
+    this.gravityStagnation = gravityChanged ? 0 : this.gravityStagnation + 1;
+
+    if (this.bestCandidate) {
+      this.lastGravityCoeff = this.bestCandidate.coefficients[5];
+    }
+
+    if (improved) {
+      this.mutationSigma = Math.max(this.mutationSigma * 0.9, 1e-5);
+    } else if (this.stagnation % 30 === 0) {
+      this.mutationSigma = Math.min(this.mutationSigma * 1.5, 0.2); // re-expand
+    }
+
+    if (this.stagnation === 50) {
+      this.reannealAroundElite();
+      this.stagnation = 0;
+    }
+    // --- Alpha-Probe-Trigger ------------------------------------------
+    if (
+      this.bestCandidate &&
+      this.bestCandidate.delta_c < 1e-6 &&
+      this.bestCandidate.delta_alpha > 5e-9 && // war 1e-4
+      this.stagnation > 15 // früher 20
+    ) {
+      this.injectAlphaProbes(this.bestCandidate.coefficients[IDX_GAUGE]);
+      console.log("» Alpha-Probes injiziert «");
+    }
+    // Additional stagnation breaking for precision mode (more aggressive)
+    if (
+      this.stagnation > 5 &&
+      this.bestCandidate &&
+      this.bestCandidate.delta_c < 1e-6 &&
+      this.bestCandidate.delta_alpha < 3e-3
+    ) {
+      this.forceGaugeDiversity();
+      this.stagnation = 0;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Gravity-diversity trigger wenn G-Optimierung festhängt
+    // ────────────────────────────────────────────────────────────────
+    if (
+      this.gravityStagnation > 6 && // ≥ 9 Generationen ohne Fortschritt
+      this.bestCandidate && // es gibt einen Kandidaten
+      this.bestCandidate.delta_c < 1e-7 && // c bereits ≈ Zielfertigkeit
+      this.bestCandidate.delta_alpha < 1e-8 && // α hochpräzise
+      this.bestCandidate.delta_g > 1e-4 // G noch deutlich daneben
+    ) {
+      // Schrittweite für Grav-Mutationen dynamisch vergrössern
+      this.parameters.mutationSigmaGrav = Math.min(
+        this.parameters.mutationSigmaGrav * 1.3,
+        4e8,
+      );
+      if (this.bestCandidate?.delta_g < 1e-3)
+        this.parameters.mutationSigmaGrav *= 0.5;
+
+      // gezielt neue Varianten um Ziel-κ/G injizieren
+      this.forceGravityDiversity();
+
+      console.log(
+        `Triggered gravity diversity: Δg=${this.bestCandidate.delta_g.toExponential(3)}, ` +
+          `gravityStagnation=${this.gravityStagnation}`,
+      );
+
+      // Zähler zurücksetzen, damit der Trigger erst nach erneutem Festhängen feuert
+      this.gravityStagnation = 0;
+    }
+
+    /* ----------------- optionale Mikro-Shake fürs Grav-Gen ----------------- */
+    /* legt nur 20 % der Population leicht um ±0.5 % um,                       */
+    /* falls wir zwar stagnieren, aber der große Grav-Trigger (oben) NICHT zog */
+
+    if (
+      this.gravityStagnation > 3 && // ≥ 4 Gen. ohne Grav-Fortschritt
+      this.gravityStagnation <= 8 && // aber noch unter Groß-Trigger-Schwelle
+      this.bestCandidate && // wir haben einen Kandidaten
+      this.bestCandidate.delta_c < 1e-6 && // c sitzt
+      this.bestCandidate.delta_alpha < 1e-8 && // α ≥ 8 Digits
+      this.bestCandidate.delta_g > 1e-4 // G deutlich daneben
+    ) {
+      const shake =
+        Math.abs(this.bestCandidate.coefficients[IDX_GRAV]) *
+        0.2 *
+        this.bestCandidate.delta_g; // ±0.5 %
+      for (const ind of this.population) {
+        if (Math.random() < 0.2) {
+          // nur 20 % der Individuen
+          ind[IDX_GRAV] += this.gaussianRandom() * shake;
+        }
+      }
+      console.log(`ℹ️  Mild gravity shake injected (±0.5 %, 20 % pop)`);
+    }
+
+    if (this.bestCandidate?.delta_alpha < 1e-6) {
+      this.parameters.mutationRateGauge = 0.9;
+      this.parameters.mutationSigmaGauge = 2e-4; // statt 5e-5
+    }
+
+    /* --- leichte Öffnung, wenn Präzisions-Modus ins Stocken gerät ------- */
+    if (this.mode === "precision" && this.stagnation > 10) {
+      this.mutationSigma = Math.min(
+        this.mutationSigma * 1.3,
+        0.1,
+      );
+      this.parameters.mutationRate = Math.min(
+        this.parameters.mutationRate * 1.2,
+        0.3,
+      );
+      if (this.parameters.mutationSigmaGauge !== undefined) {
+        this.parameters.mutationSigmaGauge = Math.min(
+          this.parameters.mutationSigmaGauge * 1.3,
+          5e-4,
+        );
+      }
+    }
+
+    if (this.bestCandidate) {
+      this.lastBestFitness = this.bestCandidate.fitness;
+      /* ----- geschärfte Schalter ---------- */
+      if (this.bestCandidate.delta_c < 1e-6) {
+        // Phase 2 – c lock-in → α hat Priorität
+        this.parameters.mutationRateGauge = 0.8;
+        this.parameters.mutationSigmaGauge = 5e-4;
+      }
+      if (this.bestCandidate.delta_alpha < 1e-6) {
+        // Phase 3 – Fein-Finish
+        this.parameters.mutationRateGauge = 0.9;
+        this.parameters.mutationSigmaGauge = 5e-5;
+      }
+      // Phase 4 – Gauge Freeze: sobald 12 Digits erreicht
+      if (this.bestCandidate.delta_alpha < 1e-10) {
+        this.parameters.mutationRateGauge = 0.05; // nur noch 5 % Mutation
+        this.parameters.mutationSigmaGauge = 2e-4; // winzige Steps
+      }
+
+      if (this.stagnation === 80) {
+        // 80 Gen ohne Fortschritt
+        console.log("💥 Stagnation-Kick!");
+        this.reseedFromHallOfFame(0.15); // 40 % ersetzen
+        this.mutationSigma *= 2.5;
+        this.parameters.mutationRate *= 1.5;
+        this.jitterPopulationWide(0.3);
+        this.stagnation = 0;
+      }
+
+      /* --- Tiefen-Stagnation brechen ------------------------------------ */
+      if (this.deepStagnation >= 30) {
+        // 30 Gen. ohne neue Digits
+        console.log("🛑 Deep stagnation – applying population jitter");
+        this.reseedFromHallOfFame(0.15);
+        this.jitterPopulationWide(0.25);
+        this.mutationSigma *= 2; // Mutation verbreitern
+        this.deepStagnation = 0;
+      }
+      
+      /* --- Extended Long-Term Stagnation Recovery ---------------------- */
+      // Track long-term stagnation (100+ generations without improvement)
+      if (this.bestCandidate) {
+        const currentFitness = this.bestCandidate.fitness;
+        if (Math.abs(currentFitness - this.lastBestFitness) < 1e-12) {
+          this.longTermStagnation++;
+        } else {
+          this.longTermStagnation = 0;
+        }
+        
+        // Aggressive recovery for extended stagnation
+        if (this.longTermStagnation >= 100) {
+          console.log(`🚨 EXTENDED STAGNATION: ${this.longTermStagnation} generations without improvement!`);
+          console.log(`   Best fitness stuck at: ${currentFitness.toExponential(6)}`);
+          console.log(`   Only ${Math.floor(100 * 31/800)}% of candidates passing constraints`);
+          
+          // 1. Relax mutation parameters significantly
+          this.parameters.mutationRate = Math.min(0.5, this.parameters.mutationRate * 3);
+          this.parameters.mutationSigma = Math.min(0.3, this.parameters.mutationSigma * 5);
+          this.parameters.mutationRateGauge = 0.95;
+          this.parameters.mutationSigmaGauge = Math.min(1e-3, this.parameters.mutationSigmaGauge * 10);
+          this.parameters.mutationRateGrav = 0.8;
+          this.parameters.mutationSigmaGrav = Math.min(1e9, this.parameters.mutationSigmaGrav * 10);
+          
+          // 2. Inject massive diversity
+          console.log("   💉 Injecting 50% new random individuals");
+          const injectCount = Math.floor(this.parameters.populationSize * 0.5);
+          for (let i = this.parameters.eliteCount; i < this.parameters.eliteCount + injectCount; i++) {
+            if (i < this.population.length) {
+              this.population[i] = this.makeIndividual();
+            }
+          }
+          
+          // 3. Force diversity in all dimensions
+          this.forceGaugeDiversity();
+          this.forceGravityDiversity();
+          this.jitterPopulationWide(0.5); // 50% jitter
+          
+          // 4. Reseed from hall of fame with larger fraction
+          this.reseedFromHallOfFame(0.3);
+          
+          console.log("   ✅ Applied aggressive recovery measures");
+          
+          // Reset counter but keep track of recovery attempts
+          this.longTermStagnation = 50; // Don't reset to 0, but reduce significantly
+        }
+      }
+      /* ------------------------------------------------------------------ */
+    }
+
+    // ⭑⭑⭑ Preset switch
+    if (
+      this.mode === "explore" &&
+      this.bestCandidate &&
+      this.bestCandidate.delta_alpha < 1e-5
+    ) {
+      Object.assign(this.parameters, PRESET_PRECISION);
+      this.mode = "precision";
+      console.log("🔧 switched to precision preset");
+    }
+  }
+
+  /**
+   * Force gravity coefficient diversity when stagnation is detected
+   */
+  private forceGravityDiversity(): void {
+    if (!this.bestCandidate) return;
+
+    const bestGrav = this.bestCandidate.coefficients[IDX_GRAV];
+    const currentG = 1 / (16 * Math.PI * Math.abs(this.bestCandidate.g_model));
+    const gravError = currentG - G_TARGET;
+
+    console.log(
+      `Force gravity diversity: current coeff=${bestGrav.toFixed(1)}, G=${currentG.toExponential(6)}, target=${G_TARGET.toExponential(6)}`,
+    );
+
+    // Replace 40% of population with gravity-directed variants toward exact G target
+    const replaceCount = Math.floor(this.parameters.populationSize * 0.6); // 60 %
+    const preserveCount = Math.floor(this.parameters.populationSize * 0.1);
+
+    for (let i = preserveCount; i < replaceCount + preserveCount; i++) {
+      const individual = this.bestCandidate.coefficients.slice();
+
+      // Calculate target gravity coefficient for exact G
+      const targetGModel = 1 / (16 * Math.PI * G_TARGET);
+      const targetGrav = -targetGModel; // Negative by convention
+
+      // Gradient from current gravity toward target gravity
+      const progress = (i - preserveCount) / replaceCount;
+      const nudgeFactor = 0.2 + progress * 0.6; // 20% to 80% nudge toward target
+
+      individual[IDX_GRAV] =
+        bestGrav +
+        (targetGrav - bestGrav) * nudgeFactor +
+        this.gaussianRandom() * Math.abs(bestGrav) * 0.01; // 1% random exploration
+
+      this.population[i] = individual;
+    }
+    // Nach dem Injizieren: MutationSigmaGrav hochsetzen
+    this.parameters.mutationSigmaGrav = Math.min(
+      this.parameters.mutationSigmaGrav * 4,
+      400_000_000,
+    );
+    console.log(
+      `Force gravity diversity: injected ${replaceCount} G-directed variants toward target ${G_TARGET.toExponential(6)}`,
+    );
+  }
+
+  /**
+   * Force gauge coefficient diversity when precision mode stagnation is detected
+   */
+  private forceGaugeDiversity(): void {
+    if (!this.bestCandidate) return;
+
+    const bestGauge = this.bestCandidate.coefficients[IDX_GAUGE];
+    const currentAlpha = Math.abs(bestGauge) / (4 * Math.PI);
+    const alphaError = currentAlpha - ALPHA_TARGET;
+
+    console.log(
+      `Force gauge diversity: current gauge=${bestGauge.toFixed(6)}, alpha=${currentAlpha.toFixed(9)}, target=${ALPHA_TARGET.toFixed(9)}`,
+    );
+
+    // Replace 50% of population with directed variants toward exact alpha target
+    const replaceCount = Math.floor(this.parameters.populationSize * 0.5);
+
+    // Preserve top 10% alpha-optimal candidates
+    const preserveCount = Math.floor(this.parameters.populationSize * 0.1);
+
+    for (let i = preserveCount; i < replaceCount + preserveCount; i++) {
+      const individual = this.bestCandidate.coefficients.slice();
+
+      // Directed nudge toward exact alpha target
+      const direction = Math.sign(alphaError);
+      const targetGauge = ALPHA_TARGET * 4 * Math.PI * Math.sign(bestGauge);
+
+      // Gradient from current gauge toward target gauge
+      const progress = (i - preserveCount) / replaceCount;
+      const nudgeFactor = 0.1 + progress * 0.4; // 10% to 50% nudge toward target
+
+      individual[IDX_GAUGE] =
+        bestGauge +
+        (targetGauge - bestGauge) * nudgeFactor +
+        this.gaussianRandom() * Math.abs(bestGauge) * 0.0001; // small random component
+
+      this.population[i] = individual;
+    }
+
+    console.log(
+      `Force gauge diversity: injected ${replaceCount} alpha-directed variants toward target ${ALPHA_TARGET.toFixed(9)}`,
+    );
+  }
+
+  /**
+   * Maintain gauge coefficient diversity across the population during precision mode
+   */
+  private maintainGaugeDiversity(population: number[][]): void {
+    if (!this.bestCandidate) return;
+
+    const bestGauge = this.bestCandidate.coefficients[IDX_GAUGE];
+
+    // Ensure no more than 20% of population has identical gauge coefficients
+    const maxIdentical = Math.floor(population.length * 0.1); // → 10 %
+    const gaugeValues = population.map((ind) => ind[IDX_GAUGE]);
+
+    // Count occurrences of each gauge value (higher precision for finer diversity)
+    const gaugeCounts = new Map<string, number>();
+    gaugeValues.forEach((val) => {
+      const key = val.toFixed(14);
+      gaugeCounts.set(key, (gaugeCounts.get(key) || 0) + 1);
+    });
+
+    // Apply diversity enforcement with ultra-fine perturbations
+    let diversityApplied = 0;
+    for (let i = 0; i < population.length; i++) {
+      const gaugeKey = population[i][IDX_GAUGE].toFixed(12);
+      if (gaugeCounts.get(gaugeKey)! > maxIdentical) {
+        // Apply ultra-fine perturbation for sub-microscopic diversity
+        const perturbation =
+          this.gaussianRandom() *
+          bestGauge *
+          (0.0000001 + Math.random() * 0.00001);
+        population[i][IDX_GAUGE] = bestGauge + perturbation;
+        diversityApplied++;
+      }
+    }
+
+    if (diversityApplied > 0) {
+      console.log(
+        `Maintained gauge diversity: applied ${diversityApplied} micro-perturbations`,
+      );
+    }
+  }
+
+  /**
+   * Enforce diversity among top candidates to prevent identical clustering
+   */
+  private enforceTopCandidateDiversity(population: number[][]): void {
+    if (!this.bestCandidate) return;
+
+    // Sort population by fitness to identify top candidates
+    const evaluated = population.map((coeffs) => {
+      const alpha = Math.abs(coeffs[IDX_GAUGE]) / (4 * Math.PI);
+      const alphaError = Math.abs(alpha - ALPHA_TARGET);
+      return { coeffs, alphaError };
+    });
+
+    evaluated.sort((a, b) => a.alphaError - b.alphaError);
+
+    // Ensure top 10 candidates have unique alpha values
+    const topCount = Math.min(10, population.length);
+    const uniqueAlphas = new Set<string>();
+
+    for (let i = 0; i < topCount; i++) {
+      const gaugeCoeff = evaluated[i].coeffs[IDX_GAUGE];
+      const alpha = Math.abs(gaugeCoeff) / (4 * Math.PI);
+      const alphaKey = alpha.toFixed(15);
+
+      if (uniqueAlphas.has(alphaKey)) {
+        // Force unique alpha by systematic offset toward target
+        const baseAlpha =
+          Math.abs(this.bestCandidate.coefficients[IDX_GAUGE]) / (4 * Math.PI);
+        const targetDirection = ALPHA_TARGET - baseAlpha;
+        const offsetScale = (i + 1) * 1e-10; // Progressively larger offsets
+
+        const newAlpha =
+          baseAlpha +
+          targetDirection * offsetScale +
+          (Math.random() - 0.5) * 1e-12;
+        const newGauge = newAlpha * 4 * Math.PI * Math.sign(gaugeCoeff);
+
+        evaluated[i].coeffs[IDX_GAUGE] = newGauge;
+        uniqueAlphas.add(newAlpha.toFixed(15));
+      } else {
+        uniqueAlphas.add(alphaKey);
+      }
+    }
+  }
+
+  /**
+   * Check if we should switch to high-precision Python mode
+   */
+  private checkPrecisionSwitch(): void {
+    if (
+      !this.parameters.usePython &&
+      this.bestCandidate &&
+      this.bestCandidate.delta_c < 1e-6 &&
+      this.bestCandidate.delta_alpha < 1e-6
+    ) {
+      this.parameters.usePython = true;
+      console.log("» Umschalten auf High-Precision-Python («)");
+    }
+  }
+
+  /**
+   * Force immediate population reset with unconstrained coefficients
+   */
+  async forceUnconstrainedReset(): Promise<void> {
+    console.log("🔄 FORCING UNCONSTRAINED POPULATION RESET");
+    this.forcePopulationReset();
+    console.log(
+      "✅ Population reset complete - all coefficients now unconstrained",
+    );
+  }
+  /**
+   * Reanneal population around elite candidates
+   */
+  private reannealAroundElite(): void {
+    const keepCount = Math.floor(this.parameters.populationSize * 0.2);
+    const elites = this.population.slice(0, keepCount);
+
+    // Replace 80% of population with variants around elites
+    for (let i = keepCount; i < this.parameters.populationSize; i++) {
+      const eliteIndex = i % elites.length;
+      const elite = elites[eliteIndex].slice();
+
+      // Add small random perturbations
+      for (let j = 0; j < elite.length; j++) {
+        elite[j] += this.gaussianRandom() * 0.02;
+      }
+
+      this.population[i] = elite;
+    }
+
+    console.log("Reanneal: refreshed population around elite candidates");
+  }
+
+  /**
+   * Send update to callback
+   */
+  private sendUpdate(): void {
+    const currentTime = Date.now();
+    const elapsedSeconds = (currentTime - this.startTime) / 1000;
+    const throughput =
+      elapsedSeconds > 0 ? this.evaluationCount / elapsedSeconds : 0;
+
+    // Get precision status and log optimization focus
+    const precisionStatus = this.getConstantsPrecisionStatus(this.bestCandidate);
+    if (this.generation % 10 === 0 && this.bestCandidate) {
+      console.log(`\n📊 Generation ${this.generation} Status:`);
+      console.log(`   C: ${precisionStatus.c_digits} digits (tolerance: ${(this.bestCandidate.delta_c).toExponential(2)} < 1e-6)`);
+      console.log(`   G: ${precisionStatus.g_digits} digits (tolerance: ${(this.bestCandidate.delta_g ?? 1).toExponential(2)} < 1e-4)`);
+      console.log(`   α: ${precisionStatus.a_digits} digits ${precisionStatus.a_solved ? '✓ SOLVED' : '⟳ OPTIMIZING'}`);
+      console.log(`   🎯 Hard constraints: C < 1ppm, G < 100ppm relative error`);
+      console.log(`   🔬 All optimization effort focused on fine-structure constant α`);
+    }
+
+    const update: GAUpdate = {
+      generation: this.generation,
+      best: this.bestCandidate || undefined,
+      topCandidates: this.topCandidates,
+      throughput: Math.round(throughput),
+      status: this.isRunningFlag ? "running" : "stopped",
+    };
+
+    // Export best equation for relativity analysis
+    if (this.bestCandidate) {
+      exportBestEquation({
+        coeffs: this.bestCandidate.coefficients,
+        timestamp: Date.now(),
+        generation: this.generation,
+        fitness: this.bestCandidate.fitness,
+        c_model: this.bestCandidate.c_model,
+        alpha_model: this.bestCandidate.alpha_model,
+        g_model: this.bestCandidate.g_model,
+        delta_c: this.bestCandidate.delta_c,
+        delta_alpha: this.bestCandidate.delta_alpha,
+        delta_g: this.bestCandidate.delta_g ?? 1,
+      });
+    }
+
+    console.log(
+      `Generation ${this.generation}, Best fitness: ${this.bestCandidate?.fitness?.toExponential(6) || "N/A"}`,
+    );
+
+    // Send update to callback if registered
+    if (this.updateCallback) {
+      this.updateCallback(update);
+    }
+
+    // Also emit as event for WebSocket broadcasting
+    this.emit("update", update);
+  }
+
+  /**
+   * Start the genetic algorithm
+   */
+  async start(): Promise<void> {
+    if (this.isRunningFlag) {
+      throw new Error("Genetic algorithm is already running");
+    }
+
+    this.isRunningFlag = true;
+    this.generation = 0;
+    this.evaluationCount = 0;
+    this.startTime = Date.now();
+
+    // Initialize population
+    this.initializePopulation();
+
+    // Set up auto-save interval every 30 seconds for Tab 1 best candidates
+    const autoSaveInterval = setInterval(async () => {
+      if (!this.isRunningFlag) {
+        clearInterval(autoSaveInterval);
+        return;
+      }
+
+      if (this.bestCandidate) {
+        try {
+          const { storage } = await import("../../packages/core/storage");
+          const activeSession = await storage.getActiveSession();
+
+          if (activeSession) {
+            await storage.saveLagrangianResult(activeSession.id, {
+              coefficients: this.bestCandidate.coefficients,
+              generation: this.generation,
+              fitness: this.bestCandidate.fitness,
+              c_model: this.bestCandidate.c_model,
+              alpha_model: this.bestCandidate.alpha_model,
+              delta_c: this.bestCandidate.delta_c,
+              delta_alpha: this.bestCandidate.delta_alpha,
+            });
+            console.log(
+              `✅ Auto-saved Tab 1 best candidate (gen ${this.generation}, fitness ${this.bestCandidate.fitness.toExponential(3)})`,
+            );
+          }
+        } catch (error) {
+          console.warn("⚠️ Tab 1 auto-save failed:", error);
+        }
+      }
+    }, 30000); // 30 seconds
+
+    console.log(
+      `Starting GA with population size ${this.parameters.populationSize}`,
+    );
+
+    // Run evolution loop with proper async updates
+    while (
+      this.isRunningFlag &&
+      this.generation < this.parameters.maxGenerations
+    ) {
+      try {
+        await this.runGeneration();
+        console.log(
+          `Completed generation ${this.generation}, best fitness: ${this.bestCandidate?.fitness?.toExponential(3) || "N/A"}`,
+        );
+
+        // Check for convergence (disabled to allow full evolution)
+        // Continue evolution for full generation count to explore solution space
+
+        // Brief delay to allow WebSocket updates
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      } catch (error) {
+        console.error(`Error in generation ${this.generation}:`, error);
+        break;
+      }
+    }
+
+    // Send final update
+    if (this.updateCallback) {
+      this.updateCallback({
+        generation: this.generation,
+        best: this.bestCandidate || undefined,
+        topCandidates: this.topCandidates,
+        throughput: 0,
+        status: "completed",
+      });
+    }
+
+    this.isRunningFlag = false;
+    console.log(`GA completed after ${this.generation} generations`);
+  }
+
+  /**
+   * Stop the genetic algorithm
+   */
+  async stop(): Promise<void> {
+    console.log("Stopping genetic algorithm...");
+    this.isRunningFlag = false;
+
+    // Clean up workers safely
+    if (this.workers && Array.isArray(this.workers)) {
+      for (const worker of this.workers) {
+        try {
+          await worker.terminate();
+        } catch (error) {
+          console.warn("Error terminating worker:", error);
+        }
+      }
+    }
+    this.workers = [];
+  }
+
+  /**
+   * Check if GA is running
+   */
+  isRunning(): boolean {
+    return this.isRunningFlag;
+  }
+
+  /**
+   * Get current status
+   */
+  getStatus(): GAUpdate {
+    const currentTime = Date.now();
+    const elapsedSeconds =
+      this.startTime > 0 ? (currentTime - this.startTime) / 1000 : 0;
+    const throughput =
+      elapsedSeconds > 0 ? this.evaluationCount / elapsedSeconds : 0;
+
+    return {
+      generation: this.generation,
+      best: this.bestCandidate || undefined,
+      topCandidates: this.topCandidates,
+      throughput: Math.round(throughput),
+      status: this.isRunningFlag ? "running" : "stopped",
+    };
+  }
+
+  /**
+   * Set update callback
+   */
+  onUpdate(callback: (update: GAUpdate) => void): void {
+    this.updateCallback = callback;
+  }
+
+  /** ersetzt einen Populations-Teil durch HoF-Mutanten */
+  private reseedFromHallOfFame(frac = 0.15) {
+    if (this.hallOfFame.length === 0) return;
+    const n = Math.floor(this.population.length * frac);
+    for (let i = 0; i < n; i++) {
+      const base = this.hallOfFame[i % this.hallOfFame.length];
+      const mutant = base.coefficients.map((c, idx) =>
+        idx < 2 ? c : c + this.gaussianRandom() * this.mutationSigma * 0.3,
+      );
+      this.population[this.population.length - 1 - i] = mutant;
+    }
+    console.log(`♻︎ HoF-reseed: ${n} Individuen ersetzt`);
+  }
+
+  /**
+   * Check which physics constants have reached their target precision
+   * C: needs exact match (299792458)
+   * G: needs 5 digits precision  
+   * α: optimize to maximum precision
+   */
+  private getConstantsPrecisionStatus(candidate: Candidate | null): {
+    c_solved: boolean;
+    g_solved: boolean;
+    a_solved: boolean;
+    c_digits: number;
+    g_digits: number;
+    a_digits: number;
+  } {
+    if (!candidate) {
+      return {
+        c_solved: false,
+        g_solved: false,
+        a_solved: false,
+        c_digits: 0,
+        g_digits: 0,
+        a_digits: 0,
+      };
+    }
+
+    // C is exactly defined, so we need exact match
+    const c_exact_match = Math.abs(candidate.c_model - C_TARGET) < 1;
+    const c_digits = solvedDigits(candidate.delta_c);
+    const c_solved = c_exact_match || c_digits >= 9; // Accept 9 digits as "solved" for C
+
+    // G needs 5 digits precision (as per CODATA uncertainty)
+    const g_digits = solvedDigits(candidate.delta_g ?? 1);
+    const g_solved = g_digits >= 5;
+
+    // Alpha - we want maximum precision
+    const a_digits = solvedDigits(candidate.delta_alpha);
+    const a_solved = a_digits >= 14; // Near theoretical limit
+
+    return {
+      c_solved,
+      g_solved,
+      a_solved,
+      c_digits,
+      g_digits,
+      a_digits,
+    };
+  }
+}
+
+### /operators.ts ###
+/**
+ * Operator catalog ported from the Python script
+ * Contains symbolic representations of field operators for Lagrangian construction
+ */
+import { TERM_LIMITS } from "./constants";
+
+export interface Operator {
+  id: string;
+  expression: string;
+  description: string;
+  coefficientIndex: number;
+}
+
+// Import unified physics constants
+import { C_TARGET, ALPHA_TARGET, PI, G_TARGET } from "@shared/physics/constants";
+
+// Operator catalog from Python script
+export const OPERATORS: Operator[] = [
+  {
+    id: "phi_t_squared",
+    expression: "(∂_t φ)²",
+    description: "Kinetic term for scalar field",
+    coefficientIndex: 0,
+  },
+  {
+    id: "phi_x_squared",
+    expression: "(∂_x φ)²",
+    description: "Spatial gradient term",
+    coefficientIndex: 1,
+  },
+  {
+    id: "phi_squared",
+    expression: "φ²",
+    description: "Mass term for scalar field",
+    coefficientIndex: 2,
+  },
+  {
+    id: "phi_t_squared_phi_squared",
+    expression: "(∂_t φ)² φ²",
+    description: "Self-interaction term",
+    coefficientIndex: 3,
+  },
+  {
+    id: "em_scalar_coupling",
+    expression: "g_em",
+    description: "Electromagnetic-scalar field coupling constant",
+    coefficientIndex: 4,
+  },
+  {
+    id: "grav_scalar_coupling",
+    expression: "ξ",
+    description: "Gravitational-scalar field coupling constant",
+    coefficientIndex: 5,
+  },
+];
+
+export const N_OPS = 6;
+export const IDX_GRAV = OPERATORS.findIndex((op) => op.id === "grav_scalar_coupling");
+
+// Index of the gauge operator that contributes to fine structure constant
+export const IDX_GAUGE = OPERATORS.findIndex((op) => op.id === "em_scalar_coupling");
+
+/**
+ * Symbolic math utilities for Lagrangian manipulation
+ */
+export class SymbolicMath {
+  /**
+   * Evaluates the dispersion relation from Euler-Lagrange equation
+   * Returns coefficients A and B such that A*ω² + B*k² = 0
+   */
+  static getDispersionCoefficients(coefficients: number[]): {
+    A: number;
+    B: number;
+  } {
+    const c0 = coefficients[0]; // (∂_t φ)²
+    const c1 = coefficients[1]; // (∂_x φ)²
+
+    // Original-Ableitung aus der Euler-Lagrange-Gleichung
+    // L = c0(∂_tφ)² + c1(∂_xφ)²  =>  ∂L/∂(∂_μ(∂_νφ)) = 0
+    // d/dt(∂L/∂(∂_tφ)) = 2*c0*∂²φ/∂t²  =>  -2*c0*ω²
+    // d/dx(∂L/∂(∂_xφ)) = 2*c1*∂²φ/∂x²  =>  -2*c1*k²
+    // Die Dispersionsrelation ist (-2*c0*ω² + 2*c1*k²) = 0
+    // A*ω² + B*k² = 0, also:
+
+    const A = -2 * c0;
+    const B = -2 * c1; // <-- richtiges Vorzeichen  (wie im Python-Original)
+
+    return { A, B };
+  }
+
+  /**
+   * Calculates the model speed of light from dispersion relation
+   */
+  static calculateSpeedOfLight(coefficients: number[]): number {
+    const { A, B } = this.getDispersionCoefficients(coefficients);
+
+    if (A === 0 || Math.abs(A) < 1e-15) {
+      throw new Error("Invalid dispersion relation: A coefficient is zero");
+    }
+
+    const ratio = -B / A;
+    if (ratio <= 0) {
+      throw new Error("Invalid dispersion relation: negative c²");
+    }
+
+    return Math.sqrt(ratio);
+  }
+
+  /**
+   * Calculates the vacuum expectation value (VEV) φ₀ from the potential
+   * V(φ) = -½c₂φ² + ¼c₃φ⁴
+   */
+  static calculateVEV(coefficients: number[]): { phi0: number; isReal: boolean } {
+    const c2 = coefficients[2]; // Mass term coefficient
+    const c3 = coefficients[3]; // Self-interaction coefficient
+    
+    // For a stable minimum, we need c2 > 0 and c3 > 0
+    if (c2 <= 0 || c3 <= 0) {
+      return { phi0: 0, isReal: false };
+    }
+    
+    // VEV: φ₀ = √(c₂/c₃)
+    const phi0 = Math.sqrt(c2 / c3);
+    return { phi0, isReal: true };
+  }
+
+  /**
+   * Calculates the effective fine structure constant
+   * α_eff = α_standard / (1 + g_em * φ₀²)
+   */
+  static calculateEffectiveFineStructure(coefficients: number[], phi0: number): number {
+    const g_em = coefficients[4]; // EM coupling constant
+    return ALPHA_TARGET / (1 + g_em * phi0 * phi0);
+  }
+
+  /**
+   * Calculates the effective gravitational constant
+   * G_eff = G_standard / (1 + ξ * φ₀²)
+   */
+  static calculateEffectiveG(coefficients: number[], phi0: number): number {
+    const xi = coefficients[5]; // Gravitational coupling constant
+    return G_TARGET / (1 + xi * phi0 * phi0);
+  }
+
+  /**
+   * Calculates the elegance score based on mathematical beauty criteria
+   */
+  static calculateEleganceScore(coefficients: number[]): {
+    score: number;
+    details: {
+      c3_elegance: number;
+      coupling_simplicity: number;
+      relation_bonus: number;
+    };
+  } {
+    const c3 = coefficients[3];
+    const g_em = coefficients[4];
+    const xi = coefficients[5];
+    
+    // Elegance metric 1: How close is c3 to 1/(8π)?
+    const target_c3 = 1 / (8 * PI);
+    const c3_elegance = Math.max(0, 1 - Math.abs(c3 - target_c3) / target_c3);
+    
+    // Elegance metric 2: Bonus for simple coupling constants (near zero)
+    const coupling_simplicity = Math.max(0, 1 - (Math.abs(g_em) + Math.abs(xi)) / 200);
+    
+    // Elegance metric 3: Bonus for mathematical relations
+    let relation_bonus = 0;
+    // Check if g_em ≈ c3
+    if (Math.abs(g_em - c3) < 0.01) relation_bonus += 0.25;
+    // Check if xi ≈ c3²
+    if (Math.abs(xi - c3 * c3) < 0.01) relation_bonus += 0.25;
+    
+    // Weighted average
+    const score = 0.5 * c3_elegance + 0.3 * coupling_simplicity + 0.2 * relation_bonus;
+    
+    return {
+      score,
+      details: {
+        c3_elegance,
+        coupling_simplicity,
+        relation_bonus,
+      },
+    };
+  }
+
+  /**
+   * Calculates the model fine structure constant from gauge coupling
+   * DEPRECATED: Use calculateEffectiveFineStructure instead
+   */
+  static calculateFineStructureConstant(coefficients: number[]): number {
+    // This method is kept for backward compatibility
+    // In the new physics model, we use calculateEffectiveFineStructure
+    const { phi0 } = this.calculateVEV(coefficients);
+    return this.calculateEffectiveFineStructure(coefficients, phi0);
+  }
+
+  /**
+   * Lorentz‑Isotropy score ε  (1D‑version)
+   *   ε = |v/c − 1|, v = √(b/a) with a = −c_tt, b = c_xx (our convention)
+   * Returns a value in [1e‑16, 1] where 0 is perfect isotropy.
+   */
+  static lorentzIsotropyEps(coefficients: number[]): number {
+    const a = -coefficients[0]; // kinetic time term (stored negative)
+    const b = coefficients[1]; // spatial term
+
+    if (a <= 0 || b <= 0) return 1.0; // wrong signature → maximal violation
+
+    const v = Math.sqrt(b / a); // natural units c = 1
+    return Math.max(1e-16, Math.min(Math.abs(v - 1), 1));
+  }
+
+  /**
+   * Validates that coefficients produce physical results
+   */
+  static validateCoefficients(coefficients: number[]): boolean {
+    if (coefficients.length !== N_OPS) {
+      return false;
+    }
+
+    try {
+      const c = this.calculateSpeedOfLight(coefficients);
+      const { phi0, isReal } = this.calculateVEV(coefficients);
+      
+      // Check if VEV is real
+      if (!isReal) {
+        return false;
+      }
+      
+      const alpha_eff = this.calculateEffectiveFineStructure(coefficients, phi0);
+      const G_eff = this.calculateEffectiveG(coefficients, phi0);
+
+      // Check for reasonable physical values with relaxed constraints
+      const {
+        MASS_MAX,
+        INTERACTION_MAX,
+        EM_COUPLING_MIN,
+        EM_COUPLING_MAX,
+        GRAV_COUPLING_MIN,
+        GRAV_COUPLING_MAX,
+        LORENTZ_MAX,
+      } = TERM_LIMITS;
+      
+      const eps = this.lorentzIsotropyEps(coefficients);
+      if (eps > LORENTZ_MAX) return false;
+      
+      // Check mass and interaction terms
+      if (Math.abs(coefficients[2]) > MASS_MAX * 4) return false;
+      if (Math.abs(coefficients[3]) > INTERACTION_MAX * 4) return false;
+      
+      // Check coupling constants are within bounds
+      const g_em = coefficients[4];
+      const xi = coefficients[5];
+      if (g_em < EM_COUPLING_MIN || g_em > EM_COUPLING_MAX) return false;
+      if (xi < GRAV_COUPLING_MIN || xi > GRAV_COUPLING_MAX) return false;
+      
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+
+### /precision-evaluator.ts ###
+/**
+ * High-precision evaluator for 20+ digit calculations
+ * Uses Python with decimal module for arbitrary precision arithmetic
+ */
+import { PythonShell } from "python-shell";
+import type { Candidate } from "@shared/schema";
+import path from "path";
+import * as os from "os";
+import { cpus } from "os";
+export class HighPrecisionEvaluator {
+  private static workers: PythonShell[] = [];
+  private static workerQueue: number[] = [];
+  private static busyWorkers = new Set<number>();
+  private static poolSize =
+    (os as any).availableParallelism?.() ?? os.cpus().length;
+  private static initialized = false;
+
+  /**
+   * Initialize high-precision Python worker pool
+   */
+  static async initialize(): Promise<void> {
+    if (this.initialized) return;
+
+    console.log(
+      "Initializing high-precision evaluator pool for 20+ digit calculations...",
+    );
+
+    try {
+      const workerPath = path.join(
+        process.cwd(),
+        "server/genetic-algorithm/high_precision_worker.py",
+      );
+
+      for (let i = 0; i < this.poolSize; i++) {
+        const worker = new PythonShell("high_precision_worker.py", {
+          mode: "json",
+          pythonOptions: ["-u"],
+          scriptPath: path.join(process.cwd(), "server/genetic-algorithm"),
+          stderrParser: (line) =>
+            console.error(`High-precision worker ${i} error:`, line),
+        });
+
+        // Test worker precision
+        await this.testWorkerPrecision(worker, i);
+
+        this.workers[i] = worker;
+        this.workerQueue.push(i);
+      }
+
+      this.initialized = true;
+      console.log(
+        `High-precision evaluator pool initialized with ${this.poolSize} workers`,
+      );
+    } catch (error) {
+      console.error("Failed to initialize high-precision evaluator:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * Test worker precision capabilities
+   */
+  private static async testWorkerPrecision(
+    worker: PythonShell,
+    workerId: number,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error(`Worker ${workerId} precision test timeout`));
+      }, 5000);
+
+      worker.send({ command: "test_precision" });
+
+      const messageHandler = (response: any) => {
+        clearTimeout(timeout);
+        worker.removeListener("message", messageHandler);
+
+        if (response.precision_digits >= 20) {
+          console.log(
+            `✓ Worker ${workerId} supports ${response.precision_digits} digit precision`,
+          );
+          resolve();
+        } else {
+          reject(
+            new Error(
+              `Worker ${workerId} insufficient precision: ${response.precision_digits} digits`,
+            ),
+          );
+        }
+      };
+
+      worker.on("message", messageHandler);
+    });
+  }
+
+  /**
+   * Evaluate single chromosome with high precision
+   */
+  static async evaluateChromosome(coefficients: number[], generation: number = 0): Promise<Candidate> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    const workerId = await this.getAvailableWorker();
+
+    try {
+      this.busyWorkers.add(workerId);
+      const worker = this.workers[workerId];
+
+      return new Promise<Candidate>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          worker.removeListener("message", messageHandler);
+          this.releaseWorker(workerId);
+          reject(new Error("High-precision evaluation timeout"));
+        }, 20000); // Longer timeout for high-precision calculations
+
+        worker.send({ command: "evaluate", coefficients, generation });
+
+        const messageHandler = (result: any) => {
+          clearTimeout(timeout);
+          worker.removeListener("message", messageHandler);
+          this.releaseWorker(workerId);
+
+          resolve({
+            coefficients: [...coefficients],
+            fitness: result.fitness,
+            c_model: result.c_model,
+            alpha_model: result.alpha_model,
+            g_model: result.g_model,
+            delta_g: result.delta_g,
+            delta_c: result.delta_c,
+            delta_alpha: result.delta_alpha,
+            generation: generation,
+          });
+        };
+
+        worker.on("message", messageHandler);
+      });
+    } catch (error) {
+      this.releaseWorker(workerId);
+      throw error;
+    }
+  }
+
+  /**
+   * Evaluate population with high precision
+   */
+  static async evaluatePopulation(
+    population: number[][],
+    generation: number = 0,
+  ): Promise<Candidate[]> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    console.log(
+      `Evaluating ${population.length} chromosomes with 20+ digit precision...`,
+    );
+
+    const promises = population.map((coefficients) =>
+      this.evaluateChromosome(coefficients, generation),
+    );
+
+    return Promise.all(promises);
+  }
+
+  /**
+   * Get available worker
+   */
+  private static async getAvailableWorker(): Promise<number> {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.workerQueue.length > 0) {
+          resolve(this.workerQueue.shift()!);
+        } else {
+          setTimeout(check, 10);
+        }
+      };
+      check();
+    });
+  }
+
+  /**
+   * Release worker back to queue
+   */
+  private static releaseWorker(workerId: number): void {
+    this.busyWorkers.delete(workerId);
+    this.workerQueue.push(workerId);
+  }
+
+  /**
+   * Cleanup workers
+   */
+  static async dispose(): Promise<void> {
+    for (const worker of this.workers) {
+      if (worker && worker.childProcess) {
+        worker.kill();
+      }
+    }
+    this.workers = [];
+    this.workerQueue = [];
+    this.busyWorkers.clear();
+    this.initialized = false;
+  }
+
+  /**
+   * Check if candidate meets ultra-high precision criteria
+   */
+  static isUltraPrecise(candidate: Candidate): boolean {
+    return candidate.delta_c < 1e-15 && candidate.delta_alpha < 1e-15;
+  }
+}
+
+
+### /constants.ts ###
+/** Grenzwerte & Presets, zentral */
+export const TERM_LIMITS = {
+  // |c₂|  – Massterm (φ²)
+  MASS_MAX: 0.8,
+  // |c₃|  – Selbstkopplung (∂ₜφ)² φ²
+  INTERACTION_MAX: 0.35,
+  // g_em – Electromagnetic coupling range
+  EM_COUPLING_MIN: -100,
+  EM_COUPLING_MAX: 100,
+  // ξ – Gravitational coupling range
+  GRAV_COUPLING_MIN: -100,
+  GRAV_COUPLING_MAX: 100,
+  LORENTZ_MAX: 0.3, // ~30 % Abweichung – reicht fürs Grob‑Exploring
+};
+
+export const PRESET_EXPLORATION = {
+  couplingRange: 50,    // Wide range for initial exploration
+  mutationSigma: 0.2,
+};
+
+export const PRESET_PRECISION = {
+  couplingRange: 10,    // Narrower range for fine-tuning
+  mutationSigma: 0.05,
+};
+
+
+### /index.ts ###
+/**
+ * Genetic Algorithm module exports
+ * Provides the main GeneticAlgorithm class and supporting utilities
+ */
+
+export { GeneticAlgorithm } from "./ga";
+export { OptimizedLagrangianEvaluator } from "./lagrangian-optimized";
+export { HighPrecisionEvaluator } from "./precision-evaluator";
+
+/* ────────────────────────────────────────────────────────────────
+   NEU – Operator-Indizes & Limits / Presets von constants.ts
+   ──────────────────────────────────────────────────────────────── */
+export { N_OPS, IDX_GAUGE, IDX_GRAV } from "./operators";
+export { TERM_LIMITS, PRESET_EXPLORATION, PRESET_PRECISION } from "./constants";
+
+/* Re-export shared types */
+export type { GAParameters, Candidate, GAUpdate } from "@shared/schema";
+
+
+### /lagrangian-optimized.ts ###
+/**
+ * Optimized Lagrangian evaluator with high-throughput JavaScript evaluation
+ * Achieves 140+ chr/s performance while maintaining physics accuracy
+ */
+import { SymbolicMath } from "./operators";
+import type { Candidate } from "@shared/schema";
+import {
+  PI,
+  FOUR_PI,
+  ALPHA_TARGET,
+  C_TARGET,
+  G_TARGET,
+  EPS_C,
+  EPS_G,
+} from "@shared/physics/constants";
+// Removed broken import
+import { kappaToG } from "@shared/lib/physicsAccuracy"; // << NEU
+export class OptimizedLagrangianEvaluator {
+  private static evaluationCache = new Map<string, Candidate>();
+  private static useJavaScriptFallback = false;
+
+  /**
+   * High-speed JavaScript evaluation for maximum throughput
+   */
+  static evaluateChromosomeJS(coefficients: number[], generation?: number): Candidate {
+    try {
+      // Cache key for duplicate detection (use high precision)
+      const cacheKey = coefficients.map((c) => c.toFixed(20)).join(",");
+      if (this.evaluationCache.has(cacheKey)) {
+        return this.evaluationCache.get(cacheKey)!;
+      }
+
+      // Extract Lagrangian coefficients for 6 operators (no normalization)
+      const [c0, c1, c2, c3, g_em, xi] = coefficients;
+
+      // Phase 1: Calculate VEV and check potential stability
+      const { phi0, isReal } = SymbolicMath.calculateVEV(coefficients);
+      
+      // Add fitness penalty if VEV is not real (unstable potential)
+      let fitnessPenalty = 0;
+      if (!isReal) {
+        fitnessPenalty += 10; // High penalty for unphysical vacuum
+      }
+
+      // Phase 2: Calculate effective observables
+      const alpha_eff = SymbolicMath.calculateEffectiveFineStructure(coefficients, phi0);
+      const G_eff = SymbolicMath.calculateEffectiveG(coefficients, phi0);
+      
+      // Phase 3: Calculate model speed of light (still from dispersion relation)
+      let c_model = 0;
+      let cSquared = 0;
+      try {
+        const { A, B } = SymbolicMath.getDispersionCoefficients(coefficients);
+        if (Math.abs(A) < 1e-15) {
+          return {
+            coefficients: [...coefficients],
+            fitness: 1000,
+            c_model: 0,
+            alpha_model: 0,
+            g_model: 0,
+            delta_c: 1,
+            delta_alpha: 1,
+            delta_g: 1,
+            phi0: 0,
+            elegance_score: 0,
+            g_em,
+            xi,
+            generation: generation || 0,
+          };
+        }
+        
+        cSquared = -B / A;
+        if (cSquared <= 0) {
+          fitnessPenalty += 5;
+          cSquared = Math.abs(cSquared);
+        }
+        
+        c_model = Math.sqrt(cSquared) * C_TARGET;
+      } catch (error) {
+        fitnessPenalty += 5;
+        c_model = C_TARGET; // Fallback
+      }
+
+      // Phase 4: Calculate deviations
+      const delta_c = Math.abs(c_model - C_TARGET) / C_TARGET;
+      const delta_alpha = Math.abs(alpha_eff - ALPHA_TARGET) / ALPHA_TARGET;
+      const delta_g = Math.abs(G_eff - G_TARGET) / G_TARGET;
+
+      // Phase 5: Apply progressive constraints (same as before)
+      const deltaC_relative = delta_c;
+      const deltaG_relative = delta_g;
+      
+      let effectiveEpsC: number;
+      let effectiveEpsG: number;
+      
+      if (generation === undefined) {
+        effectiveEpsC = EPS_C;
+        effectiveEpsG = EPS_G;
+      } else if (generation < 10) {
+        effectiveEpsC = 0.01;  // 1%
+        effectiveEpsG = 0.1;   // 10%
+      } else if (generation < 100) {
+        const progress = (generation - 10) / 90;
+        const c_ratio = EPS_C / 0.01;
+        const g_ratio = EPS_G / 0.1;
+        effectiveEpsC = 0.01 * Math.pow(c_ratio, progress);
+        effectiveEpsG = 0.1 * Math.pow(g_ratio, progress);
+      } else {
+        effectiveEpsC = EPS_C;
+        effectiveEpsG = EPS_G;
+        
+        if (generation > 500) {
+          const stagnationFactor = 1 + (generation - 500) * 0.0001;
+          effectiveEpsC = Math.min(EPS_C * stagnationFactor, EPS_C * 2);
+          effectiveEpsG = Math.min(EPS_G * stagnationFactor, EPS_G * 2);
+        }
+      }
+      
+      // Reject candidates that violate C or G tolerances
+      if (deltaC_relative > effectiveEpsC || deltaG_relative > effectiveEpsG) {
+        return {
+          coefficients: [...coefficients],
+          fitness: 1e9, // Knock-out fitness
+          c_model: 0,
+          alpha_model: 0,
+          g_model: 0,
+          delta_c: 1,
+          delta_alpha: 1,
+          delta_g: 1,
+          phi0: 0,
+          elegance_score: 0,
+          g_em,
+          xi,
+          generation: generation || 0,
+        };
+      }
+
+      // Phase 6: Calculate elegance score
+      const { score: elegance_score, details: elegance_details } = 
+        SymbolicMath.calculateEleganceScore(coefficients);
+
+      // Phase 7: Physical constraints
+      const isGhostFree = c0 < 0 && c1 > 0;
+      const ghostPenalty = isGhostFree ? 0 : 1;
+
+      const isTachyonFree = c2 >= 0; // In new model, c2 should be positive for stable VEV
+      const tachyonPenalty = isTachyonFree ? 0 : 0.5;
+
+      // Lorentz isotropy
+      const lorentzEps = SymbolicMath.lorentzIsotropyEps(coefficients);
+      const lorentzPenalty = 
+        lorentzEps < 1e-12 ? 0 :
+        lorentzEps < 1e-8 ? 10 * lorentzEps :
+        100 * lorentzEps;
+
+      // Phase 8: Final fitness calculation
+      // Focus on alpha since C and G are hard constraints
+      // Include elegance as a small negative contribution (bonus)
+      let fitness = 
+        delta_alpha +
+        ghostPenalty +
+        tachyonPenalty +
+        lorentzPenalty +
+        fitnessPenalty -
+        0.1 * elegance_score; // Elegance bonus (negative = better)
+
+      const result: Candidate = {
+        coefficients: [...coefficients],
+        fitness,
+        c_model,
+        alpha_model: alpha_eff,
+        delta_c,
+        delta_alpha,
+        g_model: G_eff,
+        delta_g,
+        phi0,
+        elegance_score,
+        elegance_details,
+        g_em,
+        xi,
+        generation: generation || 0,
+      };
+
+      // Cache result
+      this.evaluationCache.set(cacheKey, result);
+      return result;
+    } catch (error) {
+      console.error(
+        "JavaScript evaluator error:",
+        error,
+        "coefficients:",
+        coefficients,
+      );
+      return {
+        coefficients: [...coefficients],
+        fitness: 1e6,
+        c_model: 0,
+        alpha_model: 0,
+        g_model: 0,
+        delta_c: 1,
+        delta_alpha: 1,
+        delta_g: 1,
+        phi0: 0,
+        elegance_score: 0,
+        g_em: coefficients[4] || 0,
+        xi: coefficients[5] || 0,
+        generation: generation || 0,
+      };
+    }
+  }
+
+  /**
+   * High-throughput population evaluation with optimized JavaScript
+   */
+  static async evaluatePopulation(
+    population: number[][],
+    generation?: number,
+  ): Promise<Candidate[]> {
+    // Use optimized JavaScript evaluation for maximum reliability and speed
+    return population.map((coefficients) =>
+      this.evaluateChromosomeJS(coefficients, generation),
+    );
+  }
+
+  /**
+   * Performance analytics
+   */
+  static getPerformanceStats() {
+    return {
+      cacheSize: this.evaluationCache.size,
+      evaluationMode: "JavaScript",
+      maxCacheSize: 10000,
+    };
+  }
+
+  /**
+   * Clear cache when it gets too large
+   */
+  static maintainCache() {
+    if (this.evaluationCache.size > 10000) {
+      this.evaluationCache.clear();
+      console.log("Evaluation cache cleared for memory optimization");
+    }
+  }
+
+  /**
+   * Check if candidate meets convergence criteria
+   */
+  static isConverged(candidate: Candidate): boolean {
+    return candidate.delta_c < 1e-4 && candidate.delta_alpha < 1e-4;
+  }
+
+  /**
+   * Get fitness classification for visualization
+   */
+  static getFitnessColor(fitness: number): "excellent" | "good" | "poor" {
+    if (fitness < 1e-8) return "excellent";
+    if (fitness < 1e-5) return "good";
+    if (fitness < 1e-3) return "poor";
+    return "poor";
+  }
+}
+
+

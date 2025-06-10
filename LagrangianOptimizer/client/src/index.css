@@ -1,0 +1,264 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Carbon Design System inspired colors */
+  --background: 240 10% 7%; /* #121212 */
+  --foreground: 0 0% 95%; /* #f2f2f2 */
+  --muted: 240 5% 15%; /* #262626 */
+  --muted-foreground: 240 5% 50%; /* #8d8d8d */
+  --popover: 240 10% 9%; /* #161616 */
+  --popover-foreground: 0 0% 95%; /* #f2f2f2 */
+  --card: 240 8% 12%; /* #1e1e1e */
+  --card-foreground: 0 0% 95%; /* #f2f2f2 */
+  --border: 240 6% 20%; /* #343434 */
+  --input: 240 6% 18%; /* #2d2d2d */
+  --input-foreground: 0 0% 95%; /* #f2f2f2 */
+  --primary: 207 90% 54%; /* #0f62fe */
+  --primary-foreground: 0 0% 98%; /* #ffffff */
+  --secondary: 240 5% 25%; /* #404040 */
+  --secondary-foreground: 0 0% 95%; /* #f2f2f2 */
+  --accent: 240 5% 20%; /* #343434 */
+  --accent-foreground: 0 0% 95%; /* #f2f2f2 */
+  --destructive: 0 84% 60%; /* #fa4d56 */
+  --destructive-foreground: 0 0% 98%; /* #ffffff */
+  --ring: 207 90% 54%; /* #0f62fe */
+  --radius: 0.5rem;
+
+  /* Carbon color tokens */
+  --carbon-10: 0 0% 98%; /* #f4f4f4 */
+  --carbon-20: 0 0% 87%; /* #e0e0e0 */
+  --carbon-30: 0 0% 78%; /* #c6c6c6 */
+  --carbon-40: 0 0% 66%; /* #a8a8a8 */
+  --carbon-50: 0 0% 55%; /* #8d8d8d */
+  --carbon-60: 0 0% 44%; /* #6f6f6f */
+  --carbon-70: 0 0% 32%; /* #525252 */
+  --carbon-80: 0 0% 22%; /* #393939 */
+  --carbon-90: 0 0% 15%; /* #262626 */
+  --carbon-100: 0 0% 9%; /* #161616 */
+
+  /* Physics visualization colors */
+  --physics-excellent: 142 71% 45%; /* #24a148 */
+  --physics-good: 43 96% 53%; /* #f1c21b */
+  --physics-poor: 0 84% 60%; /* #fa4d56 */
+}
+
+/* Fix input field visibility */
+input, textarea, select {
+  color: hsl(var(--foreground)) !important;
+  background-color: hsl(var(--input)) !important;
+  border-color: hsl(var(--border)) !important;
+}
+
+input::placeholder, textarea::placeholder {
+  color: hsl(var(--muted-foreground)) !important;
+}
+
+/* Ensure form controls are visible */
+.form-control, 
+input[type="text"], 
+input[type="number"], 
+input[type="email"], 
+input[type="password"],
+textarea,
+select {
+  color: hsl(var(--input-foreground)) !important;
+  background-color: hsl(var(--input)) !important;
+  border: 1px solid hsl(var(--border)) !important;
+}
+
+/* Focus states */
+input:focus, textarea:focus, select:focus {
+  color: hsl(var(--foreground)) !important;
+  background-color: hsl(var(--input)) !important;
+  border-color: hsl(var(--ring)) !important;
+  outline: 2px solid hsl(var(--ring)) !important;
+  outline-offset: 2px;
+}
+
+.dark {
+  --background: 240 10% 4%; /* #0a0a0a */
+  --foreground: 0 0% 98%; /* #f9f9f9 */
+  --muted: 240 5% 15%; /* #262626 */
+  --muted-foreground: 240 5% 65%; /* #a6a6a6 */
+  --popover: 240 10% 4%; /* #0a0a0a */
+  --popover-foreground: 0 0% 98%; /* #f9f9f9 */
+  --card: 240 10% 4%; /* #0a0a0a */
+  --card-foreground: 0 0% 98%; /* #f9f9f9 */
+  --border: 240 6% 20%; /* #343434 */
+  --input: 240 6% 20%; /* #343434 */
+  --input-foreground: 0 0% 98%; /* #f9f9f9 */
+  --primary: 207 90% 54%; /* #0f62fe */
+  --primary-foreground: 0 0% 98%; /* #ffffff */
+  --secondary: 240 4% 16%; /* #262626 */
+  --secondary-foreground: 0 0% 98%; /* #f9f9f9 */
+  --accent: 240 4% 16%; /* #262626 */
+  --accent-foreground: 0 0% 98%; /* #f9f9f9 */
+  --destructive: 0 62% 30%; /* #7a1e1e */
+  --destructive-foreground: 0 0% 98%; /* #f9f9f9 */
+  --ring: 240 4% 84%; /* #d6d6d6 */
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'IBM Plex Sans', 'Roboto', system-ui, -apple-system, sans-serif;
+    font-feature-settings: 'cv01', 'cv02', 'cv03', 'cv04';
+  }
+
+  /* Carbon design system utilities */
+  .carbon-10 { color: hsl(var(--carbon-10)); }
+  .carbon-20 { color: hsl(var(--carbon-20)); }
+  .carbon-30 { color: hsl(var(--carbon-30)); }
+  .carbon-40 { color: hsl(var(--carbon-40)); }
+  .carbon-50 { color: hsl(var(--carbon-50)); }
+  .carbon-60 { color: hsl(var(--carbon-60)); }
+  .carbon-70 { color: hsl(var(--carbon-70)); }
+  .carbon-80 { color: hsl(var(--carbon-80)); }
+  .carbon-90 { color: hsl(var(--carbon-90)); }
+  .carbon-100 { color: hsl(var(--carbon-100)); }
+
+  .bg-carbon-10 { background-color: hsl(var(--carbon-10)); }
+  .bg-carbon-20 { background-color: hsl(var(--carbon-20)); }
+  .bg-carbon-30 { background-color: hsl(var(--carbon-30)); }
+  .bg-carbon-40 { background-color: hsl(var(--carbon-40)); }
+  .bg-carbon-50 { background-color: hsl(var(--carbon-50)); }
+  .bg-carbon-60 { background-color: hsl(var(--carbon-60)); }
+  .bg-carbon-70 { background-color: hsl(var(--carbon-70)); }
+  .bg-carbon-80 { background-color: hsl(var(--carbon-80)); }
+  .bg-carbon-90 { background-color: hsl(var(--carbon-90)); }
+  .bg-carbon-100 { background-color: hsl(var(--carbon-100)); }
+  .bg-carbon-900 { background-color: hsl(var(--carbon-100)); }
+  .bg-carbon-950 { background-color: hsl(240 10% 3%); }
+
+  .border-carbon-10 { border-color: hsl(var(--carbon-10)); }
+  .border-carbon-20 { border-color: hsl(var(--carbon-20)); }
+  .border-carbon-30 { border-color: hsl(var(--carbon-30)); }
+  .border-carbon-40 { border-color: hsl(var(--carbon-40)); }
+  .border-carbon-50 { border-color: hsl(var(--carbon-50)); }
+  .border-carbon-60 { border-color: hsl(var(--carbon-60)); }
+  .border-carbon-70 { border-color: hsl(var(--carbon-70)); }
+  .border-carbon-80 { border-color: hsl(var(--carbon-80)); }
+  .border-carbon-90 { border-color: hsl(var(--carbon-90)); }
+  .border-carbon-100 { border-color: hsl(var(--carbon-100)); }
+
+  /* Physics color utilities */
+  .physics-excellent { color: hsl(var(--physics-excellent)); }
+  .physics-good { color: hsl(var(--physics-good)); }
+  .physics-poor { color: hsl(var(--physics-poor)); }
+
+  /* Scientific notation and code styling */
+  .font-mono {
+    font-family: 'IBM Plex Mono', 'JetBrains Mono', 'Roboto Mono', monospace;
+    font-feature-settings: 'zero', 'ss01';
+  }
+
+  /* Smooth animations for physics simulations */
+  .animate-physics {
+    animation: physics-pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes physics-pulse {
+    0%, 100% { opacity: 0.8; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.05); }
+  }
+
+  /* WebGL canvas styling */
+  canvas {
+    image-rendering: optimizeSpeed;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: -webkit-optimize-contrast;
+    image-rendering: -o-crisp-edges;
+    image-rendering: pixelated;
+    -ms-interpolation-mode: nearest-neighbor;
+  }
+
+  /* Glass morphism effects for overlays */
+  .glass-morphism {
+    background: rgba(22, 22, 22, 0.8);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  /* Improved scrollbars for dark theme */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--carbon-90));
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--carbon-60));
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--carbon-50));
+  }
+
+  /* Selection styling */
+  ::selection {
+    background: hsl(var(--primary) / 0.3);
+    color: hsl(var(--primary-foreground));
+  }
+}
+
+/* Additional component-specific styles */
+@layer components {
+  /* Slider customization for GA parameters */
+  .parameter-slider {
+    @apply bg-carbon-80 border-carbon-70;
+  }
+
+  .parameter-slider::-webkit-slider-thumb {
+    @apply bg-blue-600 border-2 border-carbon-90 rounded-full cursor-pointer;
+    height: 20px;
+    width: 20px;
+    appearance: none;
+  }
+
+  .parameter-slider::-moz-range-thumb {
+    @apply bg-blue-600 border-2 border-carbon-90 rounded-full cursor-pointer;
+    height: 20px;
+    width: 20px;
+    border: none;
+  }
+
+  /* Input field fixes */
+  .input-field-fix {
+    background-color: hsl(240 6% 18%) !important;
+    color: #ffffff !important;
+    border-color: hsl(240 6% 20%) !important;
+  }
+
+  .input-field-fix::placeholder {
+    color: hsl(240 5% 50%) !important;
+  }
+
+  /* Status indicators */
+  .status-indicator {
+    @apply w-2 h-2 rounded-full;
+    animation: pulse 2s infinite;
+  }
+
+  .status-connected {
+    @apply bg-green-500;
+  }
+
+  .status-disconnected {
+    @apply bg-red-500;
+  }
+
+  .status-running {
+    @apply bg-yellow-500;
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "reps": [
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": 0.166667, "chirality": "L"},
+    {"group": "SU2", "dim": 2, "dynkin": 0.5, "q_u1": 0.166667, "chirality": "L"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": 0.666667, "chirality": "R"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": -0.333333, "chirality": "R"},
+    {"group": "SU2", "dim": 2, "dynkin": 0.5, "q_u1": -0.5, "chirality": "L"},
+    {"group": "U1", "dim": 1, "dynkin": 1.0, "q_u1": -1.0, "chirality": "R"},
+    {"group": "U1", "dim": 1, "dynkin": 1.0, "q_u1": 0.0, "chirality": "R"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": 0.166667, "chirality": "L"},
+    {"group": "SU2", "dim": 2, "dynkin": 0.5, "q_u1": 0.166667, "chirality": "L"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": 0.666667, "chirality": "R"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": -0.333333, "chirality": "R"},
+    {"group": "SU2", "dim": 2, "dynkin": 0.5, "q_u1": -0.5, "chirality": "L"},
+    {"group": "U1", "dim": 1, "dynkin": 1.0, "q_u1": -1.0, "chirality": "R"},
+    {"group": "U1", "dim": 1, "dynkin": 1.0, "q_u1": 0.0, "chirality": "R"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": 0.166667, "chirality": "L"},
+    {"group": "SU2", "dim": 2, "dynkin": 0.5, "q_u1": 0.166667, "chirality": "L"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": 0.666667, "chirality": "R"},
+    {"group": "SU3", "dim": 3, "dynkin": 0.5, "q_u1": -0.333333, "chirality": "R"},
+    {"group": "SU2", "dim": 2, "dynkin": 0.5, "q_u1": -0.5, "chirality": "L"},
+    {"group": "U1", "dim": 1, "dynkin": 1.0, "q_u1": -1.0, "chirality": "R"},
+    {"group": "U1", "dim": 1, "dynkin": 1.0, "q_u1": 0.0, "chirality": "R"}
+  ]
+}
