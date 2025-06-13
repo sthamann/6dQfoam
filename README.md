@@ -3,12 +3,6 @@
 ![image](https://github.com/user-attachments/assets/dd8d2f34-a078-4773-98a6-881bc4e9bc60)
 
 
-Of course. Here is a rewritten, more precise version of the project's main `README.md`.
-
-This version is updated to be more direct, professionally toned, and structured to serve as a central hub that links to the more detailed documents as you requested.
-
------
-
 # The 6D Quantum Foam Universe: A Theory and its Experimental Evidence
 
 This repository presents a novel fundamental theory of physics, the computational framework used to derive its core equations, and the first compelling experimental evidence supporting its predictions.
